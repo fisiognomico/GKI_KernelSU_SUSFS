@@ -161,23 +161,26 @@ jobs:
     - name: Collect AVD Artifacts
       run: |
         mkdir -p "$GITHUB_WORKSPACE/avd-artifacts"
-        DIST_DIR="$GITHUB_WORKSPACE/kernel/out/virtual_device_aarch64/dist"
 
-        if [ -f "$DIST_DIR/Image" ]; then
-          cp "$DIST_DIR/Image" "$GITHUB_WORKSPACE/avd-artifacts/"
-          echo "✓ Found Image"
+        # Find Image in bazel output
+        IMAGE_PATH=$(find "$GITHUB_WORKSPACE/kernel" -name "Image" -type f | grep -E "(virtual-device|kernel_aarch64)" | head -1)
+        if [ -n "$IMAGE_PATH" ]; then
+          cp "$IMAGE_PATH" "$GITHUB_WORKSPACE/avd-artifacts/Image"
+          echo "✓ Found Image at: $IMAGE_PATH"
         else
           echo "Error: Image file not found"
-          find "$GITHUB_WORKSPACE/kernel/out" -name "Image" -type f 2>/dev/null || true
+          find "$GITHUB_WORKSPACE/kernel" -name "Image" -type f 2>/dev/null || true
           exit 1
         fi
 
-        if [ -f "$DIST_DIR/initramfs.img" ]; then
-          cp "$DIST_DIR/initramfs.img" "$GITHUB_WORKSPACE/avd-artifacts/"
-          echo "✓ Found initramfs.img"
+        # Find initramfs.img in bazel output
+        INITRAMFS_PATH=$(find "$GITHUB_WORKSPACE/kernel" -name "initramfs.img" -type f | head -1)
+        if [ -n "$INITRAMFS_PATH" ]; then
+          cp "$INITRAMFS_PATH" "$GITHUB_WORKSPACE/avd-artifacts/initramfs.img"
+          echo "✓ Found initramfs.img at: $INITRAMFS_PATH"
         else
           echo "Error: initramfs.img not found"
-          find "$GITHUB_WORKSPACE/kernel/out" -name "initramfs.img" -type f 2>/dev/null || true
+          find "$GITHUB_WORKSPACE/kernel" -name "initramfs.img" -type f 2>/dev/null || true
           exit 1
         fi
 
