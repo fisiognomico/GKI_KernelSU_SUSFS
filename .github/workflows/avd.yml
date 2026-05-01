@@ -245,6 +245,212 @@ jobs:
         echo "Features            : WKSU+SUSFS"
         echo "Target              : AVD (virtual_device_aarch64_dist)"
 
+  build-avd-android16:
+    name: "AVD-6.12.38-android16-5"
+    needs: fetch-commits
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Parse kernel version
+      id: parse
+      run: |
+        INPUT_VERSION="6.12.38-android16-5"
+        IFS='-' read -r KERNEL_PART ANDROID_PART REST <<< "$INPUT_VERSION"
+        KERNEL_VERSION="${KERNEL_PART%.*}"
+        SUB_LEVEL="${KERNEL_PART##*.}"
+        ANDROID_VERSION="$ANDROID_PART"
+        OS_PATCH_LEVEL="$REST"
+
+        echo "Parsed: KERNEL=$KERNEL_VERSION, SUB=$SUB_LEVEL, ANDROID=$ANDROID_VERSION, PATCH=$OS_PATCH_LEVEL"
+
+        echo "ANDROID_VERSION=$ANDROID_VERSION" >> "$GITHUB_ENV"
+        echo "KERNEL_VERSION=$KERNEL_VERSION" >> "$GITHUB_ENV"
+        echo "SUB_LEVEL=$SUB_LEVEL" >> "$GITHUB_ENV"
+        echo "OS_PATCH_LEVEL=$OS_PATCH_LEVEL" >> "$GITHUB_ENV"
+        echo "android_version=$ANDROID_VERSION" >> $GITHUB_OUTPUT
+        echo "kernel_version=$KERNEL_VERSION" >> $GITHUB_OUTPUT
+        echo "sub_level=$SUB_LEVEL" >> $GITHUB_OUTPUT
+        echo "os_patch_level=$OS_PATCH_LEVEL" >> $GITHUB_OUTPUT
+
+    - name: Free Disk Space
+      if: true
+      uses: endersonmenezes/free-disk-space@v3
+      with:
+        remove_android: true
+        remove_dotnet: true
+        remove_haskell: true
+        remove_tool_cache: true
+        remove_swap: true
+        remove_packages: "azure-cli google-cloud-cli microsoft-edge-stable google-chrome-stable firefox postgresql* temurin-* *llvm* mysql* dotnet-sdk-*"
+        remove_packages_one_command: true
+        remove_folders: "/usr/share/swift /usr/share/miniconda /usr/share/az* /usr/local/lib/node_modules /usr/local/share/chromium /usr/local/share/powershell /usr/local/julia /usr/local/aws-cli /usr/local/aws-sam-cli /usr/share/gradle"
+        rm_cmd: "rmz"
+        rmz_version: "3.1.1"
+        testing: false
+
+    - name: Setup Build Environment
+      run: |
+        mkdir -p "$GITHUB_WORKSPACE/kernel"
+        mkdir -p "$GITHUB_WORKSPACE/git-repo"
+        curl -L https://storage.googleapis.com/git-repo-downloads/repo -o "$GITHUB_WORKSPACE/git-repo/repo"
+        chmod +x "$GITHUB_WORKSPACE/git-repo/repo"
+        echo "$GITHUB_WORKSPACE/git-repo" >> "$GITHUB_PATH"
+
+        git clone https://github.com/WildKernels/kernel_patches.git "$GITHUB_WORKSPACE/kernel_patches"
+
+    - name: Download Kernel Repository
+      uses: ./.github/actions/download-kernel
+      with:
+        android_version: ${{ steps.parse.outputs.android_version }}
+        kernel_version: ${{ steps.parse.outputs.kernel_version }}
+        os_patch_level: ${{ steps.parse.outputs.os_patch_level }}
+
+    - name: Extract Sublevel and Set File Name
+      id: extract
+      run: |
+        SUBLEVEL="$SUB_LEVEL"
+        if [[ -f "$GITHUB_WORKSPACE/kernel/common/Makefile" ]]; then
+          EXTRACTED=$(grep '^SUBLEVEL = ' "$GITHUB_WORKSPACE/kernel/common/Makefile" | awk '{print $3}')
+          [[ -n "$EXTRACTED" ]] && SUBLEVEL="$EXTRACTED"
+        fi
+
+        FILE_NAME="$KERNEL_VERSION.$SUBLEVEL-$ANDROID_VERSION-$OS_PATCH_LEVEL"
+        echo "SUBLEVEL=$SUBLEVEL" >> $GITHUB_ENV
+        echo "FILE_NAME=$FILE_NAME" >> $GITHUB_ENV
+        echo "file_name=$FILE_NAME" >> $GITHUB_OUTPUT
+        echo "sublevel=$SUBLEVEL" >> $GITHUB_OUTPUT
+
+    - name: Setup Wild KSU
+      uses: ./.github/actions/wksu
+      with:
+        ksu_commit: ${{ inputs.ksu_commit || needs.fetch-commits.outputs.ksu_commit }}
+
+    - name: Setup SUSFS
+      uses: ./.github/actions/susfs
+      with:
+        android_version: ${{ steps.parse.outputs.android_version }}
+        kernel_version: ${{ steps.parse.outputs.kernel_version }}
+        os_patch_level: ${{ steps.parse.outputs.os_patch_level }}
+        sublevel: ${{ steps.extract.outputs.sublevel }}
+        susfs_commit: ${{ needs.fetch-commits.outputs.susfs_commit }}
+
+    - name: Setup SUSFS Patches
+      uses: ./.github/actions/susfs-patches
+      with:
+        android_version: ${{ steps.parse.outputs.android_version }}
+        kernel_version: ${{ steps.parse.outputs.kernel_version }}
+        os_patch_level: ${{ steps.parse.outputs.os_patch_level }}
+        sublevel: ${{ steps.extract.outputs.sublevel }}
+
+    - name: Configure Kernel Options
+      uses: ./.github/actions/configure-kernel
+      with:
+        kernel_version: ${{ steps.parse.outputs.kernel_version }}
+
+    - name: Apply Kernel Branding
+      uses: ./.github/actions/apply-kernel-branding
+      with:
+        build_type: "Normal"
+        kernel_version: ${{ steps.parse.outputs.kernel_version }}
+
+    - name: Clean Kernel Flags
+      uses: ./.github/actions/clean-kernel-flags
+
+    - name: Build AVD Kernel
+      working-directory: ${{ github.workspace }}/kernel
+      run: |
+        set -ex
+        cp "$GITHUB_WORKSPACE/wild_gki.fragment" common/arch/arm64/configs/wild_gki.fragment
+        tools/bazel build --config=fast --lto=thin \
+          --defconfig_fragment=//common:arch/arm64/configs/wild_gki.fragment \
+          //common-modules/virtual-device:virtual_device_aarch64_dist || exit 1
+
+    - name: Collect AVD Artifacts
+      run: |
+        mkdir -p "$GITHUB_WORKSPACE/avd-artifacts"
+
+        # Find Image in bazel output
+        IMAGE_PATH=$(find "$GITHUB_WORKSPACE/kernel" -name "Image" -type f | grep -E "(virtual-device|kernel_aarch64)" | head -1)
+        if [ -n "$IMAGE_PATH" ]; then
+          cp "$IMAGE_PATH" "$GITHUB_WORKSPACE/avd-artifacts/Image"
+          echo "✓ Found Image at: $IMAGE_PATH"
+        else
+          echo "Error: Image file not found"
+          find "$GITHUB_WORKSPACE/kernel" -name "Image" -type f 2>/dev/null || true
+          exit 1
+        fi
+
+        # Find initramfs.img in bazel output
+        INITRAMFS_PATH=$(find "$GITHUB_WORKSPACE/kernel" -name "initramfs.img" -type f | head -1)
+        if [ -n "$INITRAMFS_PATH" ]; then
+          cp "$INITRAMFS_PATH" "$GITHUB_WORKSPACE/avd-artifacts/initramfs.img"
+          echo "✓ Found initramfs.img at: $INITRAMFS_PATH"
+        else
+          echo "Error: initramfs.img not found"
+          find "$GITHUB_WORKSPACE/kernel" -name "initramfs.img" -type f 2>/dev/null || true
+          exit 1
+        fi
+
+        ls -la "$GITHUB_WORKSPACE/avd-artifacts/"
+
+    - name: Scan and collect patch rejects
+      id: scan
+      if: ${{ always() }}
+      run: |
+        set -e
+        CONFIG_DIR="$GITHUB_WORKSPACE/kernel"
+        REJECTS_DIR="$GITHUB_WORKSPACE/patch-rejects"
+        mkdir -p "$REJECTS_DIR"
+        mapfile -t REJS < <(find "$CONFIG_DIR" -type f -name '*.rej')
+        REJ_COUNT=${#REJS[@]}
+        echo "Found $REJ_COUNT .rej files under $CONFIG_DIR"
+        echo "REJ_COUNT=$REJ_COUNT" >> $GITHUB_ENV
+        echo "rej_count=$REJ_COUNT" >> $GITHUB_OUTPUT
+        if [ "$REJ_COUNT" -gt 0 ]; then
+          for REJ in "${REJS[@]}"; do
+            REL="${REJ#"$CONFIG_DIR"/}"
+            DEST="$REJECTS_DIR/$REL"
+            mkdir -p "$(dirname "$DEST")"
+            cp "$REJ" "$DEST"
+            ORIG="${REJ%.rej}"
+            if [ -f "$ORIG" ]; then
+              ORIG_DEST="$REJECTS_DIR/${REL%.rej}"
+              mkdir -p "$(dirname "$ORIG_DEST")"
+              cp "$ORIG" "$ORIG_DEST"
+            fi
+            echo "$REL" >> "$REJECTS_DIR/index.txt"
+          done
+        fi
+
+    - name: Upload AVD Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ steps.extract.outputs.file_name }}-AVD
+        path: ${{ github.workspace }}/avd-artifacts/**
+        if-no-files-found: error
+        compression-level: 9
+
+    - name: Upload Rejects
+      if: ${{ always() && steps.scan.outputs.rej_count > 0 }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ steps.extract.outputs.file_name }}-Rejects
+        path: patch-rejects/
+        if-no-files-found: ignore
+        compression-level: 9
+
+    - name: Build Summary
+      if: ${{ always() }}
+      run: |
+        echo "Android Version     : $ANDROID_VERSION"
+        echo "Kernel Version      : $KERNEL_VERSION"
+        echo "Features            : WKSU+SUSFS"
+        echo "Target              : AVD (virtual_device_aarch64_dist)"
+
   release:
     runs-on: ubuntu-latest
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.release_type != 'Actions' }}
@@ -252,6 +458,7 @@ jobs:
       contents: write
     needs:
     - build-avd
+    - build-avd-android16
 
     env:
       GH_TOKEN: ${{ github.token }}
@@ -265,6 +472,10 @@ jobs:
         set -euo pipefail
         if [[ "${{ needs.build-avd.result }}" != "success" ]]; then
           echo "Required job build-avd did not succeed (result: ${{ needs.build-avd.result }})"
+          exit 1
+        fi
+        if [[ "${{ needs.build-avd-android16.result }}" != "success" ]]; then
+          echo "Required job build-avd-android16 did not succeed (result: ${{ needs.build-avd-android16.result }})"
           exit 1
         fi
 
